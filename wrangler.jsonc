@@ -5,5 +5,8 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "musk-radar",
   "main": "src/worker.js",
-  "compatibility_date": "2026-09-01"
+  "compatibility_date": "2026-09-01",
+  "triggers": {
+    "crons": ["*/10 * * * *"]
+  }
 }

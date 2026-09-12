@@ -101,11 +101,41 @@ async function fetchFeed(feed, attempt) {
   }
 }
 
-async function getItems() {
-  if (memCache.items && Date.now() - memCache.ts < CACHE_TTL_MS) {
+/* エッジキャッシュ（全isolate共有）: Cloudflare Cache APIを利用 */
+const EDGE_KEY = 'https://musk.toriumis.com/__news_cache__';
+
+async function readEdge() {
+  try {
+    const r = await caches.default.match(new Request(EDGE_KEY));
+    if (!r) return null;
+    const d = await r.json();
+    return (d && Array.isArray(d.items)) ? d : null;
+  } catch (e) { return null; }
+}
+
+function writeEdge(data, ctx) {
+  try {
+    const r = new Response(JSON.stringify(data), {
+      headers: { 'content-type': 'application/json', 'cache-control': 'public, max-age=1800' }
+    });
+    const p = caches.default.put(new Request(EDGE_KEY), r);
+    if (ctx && ctx.waitUntil) ctx.waitUntil(p);
+  } catch (e) { /* best effort */ }
+}
+
+async function getItems(ctx) {
+  const now = Date.now();
+  // 1) isolateのメモリキャッシュ
+  if (memCache.items && memCache.items.length && now - memCache.ts < CACHE_TTL_MS) {
     return memCache;
   }
-  // バースト制限を避けるため、フィードを少しずつずらして投入
+  // 2) エッジキャッシュ（Cronが10分ごとに事前ウォームしている）
+  const edge = await readEdge();
+  if (edge && edge.items.length && now - edge.ts < CACHE_TTL_MS + 2 * 60 * 1000) {
+    memCache = edge;
+    return memCache;
+  }
+  // 3) ライブ取得（バースト制限を避けるため、フィードを少しずつずらして投入）
   const results = [];
   for (const feed of FEEDS) {
     results.push(fetchFeed(feed).then(
@@ -120,6 +150,8 @@ async function getItems() {
   settled.forEach((r, i) => {
     if (r.status === 'fulfilled') {
       for (const it of r.value) {
+        // eduフィードはタイトルに関連語を含むものだけ採用（クエリが本文一致でノイズを拾うため）
+        if (FEEDS[i].id === 'edu' && !/マスク|スクール|学校|教育|Astra/i.test(it.title)) continue;
         const key = it.title.replace(/[\s。、．「」『』()（）\[\]]/g, '');
         if (byLink.has(key)) {
           const ex = byLink.get(key);
@@ -156,12 +188,20 @@ async function getItems() {
   main.sort((a, b) => b.date - a.date);
   items = main;
 
-  if (items.length === 0 && lastGood && lastGood.items && lastGood.items.length) {
+  if (items.length) {
+    memCache = { ts: Date.now(), items, errors, stale: false };
+    lastGood = memCache;
+    writeEdge(memCache, ctx);
+    return memCache;
+  }
+  // 4) 取得失敗時のフォールバック: メモリの前回成功分 → エッジキャッシュ
+  if (lastGood && lastGood.items && lastGood.items.length) {
     return { ts: lastGood.ts, items: lastGood.items, errors, stale: true };
   }
-  memCache = { ts: Date.now(), items, errors, stale: items.length === 0 };
-  if (items.length) lastGood = memCache;
-  return memCache;
+  if (edge && edge.items.length) {
+    return { ts: edge.ts, items: edge.items, errors, stale: true };
+  }
+  return { ts: Date.now(), items: [], errors, stale: true };
 }
 
 /* 古いキャッシュ（取得失敗時のフォールバック用に保持） */
@@ -269,7 +309,7 @@ function renderHTML(data) {
 <title>MUSK RADAR — イーロン・マスク動向を日本語でリアルタイム追跡</title>
 <meta name="description" content="イーロン・マスクの発言・YouTube出演・SpaceX・Tesla・xAI・教育に関する日本語ニュースを自動収集・リアルタイム表示。">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<meta http-equiv="refresh" content="600">
+<meta http-equiv="refresh" content="${items.length ? 600 : 120}">
 <style>${CSS}</style>
 </head>
 <body>
@@ -323,14 +363,14 @@ const FAVICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><re
 
 /* ---------------- ハンドラ ---------------- */
 export default {
-  async fetch(request) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (url.pathname === '/favicon.svg') {
       return new Response(FAVICON, { headers: { 'content-type': 'image/svg+xml' } });
     }
 
-    const data = await getItems();
+    const data = await getItems(ctx);
 
     if (url.pathname === '/api/debug') {
       // キャッシュ無視の生データ検査
@@ -362,11 +402,12 @@ export default {
           date: it.date, dateJST: jst(it.date, 'full'), cats: it.cats
         }))
       };
+      const good = data.items.length && !data.stale;
       return new Response(JSON.stringify(payload), {
         headers: {
           'content-type': 'application/json; charset=utf-8',
           'access-control-allow-origin': '*',
-          'cache-control': 'public, max-age=300'
+          'cache-control': good ? 'public, max-age=300' : 'public, max-age=30, must-revalidate'
         }
       });
     }
@@ -375,5 +416,10 @@ export default {
     return new Response(html, {
       headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'public, max-age=120' }
     });
+  },
+
+  /* 10分ごとのCron: エッジキャッシュを事前ウォーム（訪問者の待ち時間をゼロにする） */
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(getItems(ctx));
   }
 };
