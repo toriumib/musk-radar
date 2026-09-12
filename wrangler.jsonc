@@ -1,0 +1,9 @@
+// MUSK RADAR — Cloudflare Worker 設定
+// デプロイ: npx wrangler deploy
+// カスタムドメイン: musk.toriumis.com（Workers Custom Domain）
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "musk-radar",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-09-01"
+}
